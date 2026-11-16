@@ -1,0 +1,29 @@
+[package]
+name = "bupt-autologin"
+version = "0.1.2"
+description = "北邮校园网掉线自动认证"
+license = "MIT"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 网关和探测地址都是纯 HTTP，不需要 TLS；网关按会话 cookie 处理登录
+ureq = { version = "2", default-features = false, features = ["cookies"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+if-addrs = "0.13"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

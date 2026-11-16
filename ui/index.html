@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>北邮校园网自动登录</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <section class="hero" id="hero" data-status="checking">
+    <div class="badge" aria-hidden="true">
+      <svg viewBox="0 0 64 64"><path d="M32 56a6 6 0 1 0 0-12 6 6 0 0 0 0 12Z"/><path d="M21.4 39.4a15 15 0 0 1 21.2 0l-4.9 5a8 8 0 0 0-11.4 0Z"/><path d="M11.6 29.6a29 29 0 0 1 40.8 0l-4.9 4.9a22 22 0 0 0-31 0Z"/></svg>
+    </div>
+    <div class="hero-text">
+      <h1 id="status-label">检测中…</h1>
+      <p id="status-detail">正在检查网络</p>
+      <p id="status-meta" class="meta"></p>
+    </div>
+    <button id="check" class="btn small">立即检测</button>
+  </section>
+
+  <section class="card">
+    <h2>账号</h2>
+    <div id="account-view" class="account" hidden>
+      <div class="account-info">
+        <div class="account-name" id="account-name"></div>
+        <div class="hint" id="account-hint"></div>
+      </div>
+      <button id="edit" class="btn small">修改</button>
+      <button id="remove" class="btn small danger">移除</button>
+    </div>
+    <form id="account-form" hidden>
+      <label class="field">
+        <span>学号 / 工号</span>
+        <input id="username" autocomplete="username" spellcheck="false" required>
+      </label>
+      <label class="field">
+        <span>校园网密码</span>
+        <span class="password">
+          <input id="password" type="password" autocomplete="current-password" required>
+          <button type="button" id="toggle-password" class="reveal" aria-label="显示密码">显示</button>
+        </span>
+      </label>
+      <p class="error" id="form-error" hidden></p>
+      <div class="form-actions">
+        <button type="button" id="cancel" class="btn" hidden>取消</button>
+        <button type="submit" id="save" class="btn primary">保存并登录</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>设置</h2>
+    <label class="row">
+      <span class="row-text"><span class="row-title">自动登录</span><span class="hint">掉线或换网后自动重新认证</span></span>
+      <input type="checkbox" class="switch" id="auto-login">
+    </label>
+    <label class="row">
+      <span class="row-text"><span class="row-title">开机启动</span><span class="hint">登录系统后在后台运行</span></span>
+      <input type="checkbox" class="switch" id="autostart">
+    </label>
+    <label class="row">
+      <span class="row-text"><span class="row-title">通知</span><span class="hint">自动登录成功或失败时提醒</span></span>
+      <input type="checkbox" class="switch" id="notify">
+    </label>
+    <details class="advanced">
+      <summary>高级</summary>
+      <label class="field">
+        <span>认证网关地址</span>
+        <input id="gateway" spellcheck="false" placeholder="http://10.3.8.216">
+      </label>
+      <p class="error" id="gateway-error" hidden></p>
+    </details>
+  </section>
+
+  <section class="card">
+    <h2>最近活动</h2>
+    <ul id="events" class="events"></ul>
+    <p id="events-empty" class="hint empty">暂无记录</p>
+  </section>
+
+  <footer>关闭窗口后仍在后台运行 · v<span id="version"></span> · <button id="open-log" class="link">查看日志</button></footer>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
