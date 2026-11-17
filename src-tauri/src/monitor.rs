@@ -29,6 +29,12 @@ const SETTLE_TRIES: u32 = 3;
 const MAX_BACKOFF: u64 = 600;
 const MAX_EVENTS: usize = 30;
 const MAX_LOG_BYTES: u64 = 512 * 1024;
+const BAD_PASSWORD_HINT: &str = "用户名或密码错误，已暂停自动登录，请更新密码";
+/// 虚拟网卡（VPN、虚拟机、容器、热点、AirDrop 等）的地址变化不代表换了网络
+const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
+    "utun", "tun", "tap", "wg", "tailscale", "zt", "bridge", "br-", "docker", "veth", "virbr",
+    "vmnet", "vboxnet", "vethernet", "awdl", "llw", "anpi", "ap", "gif", "stf",
+];
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +91,8 @@ struct Inner {
     snap: Snapshot,
     settings: Settings,
     password: Option<String>,
+    /// 网关明确拒绝了账号密码；在更新密码或手动检测前不再自动登录，避免账号被锁
+    bad_password: bool,
     /// 待处理的检测请求；Some(true) 表示用户手动触发，忽略暂停和退避
     request: Option<bool>,
 }
@@ -107,7 +115,7 @@ impl Monitor {
             events: Vec::new(),
         };
         // 密码在监控线程里读取：读钥匙串可能弹出授权框，不能阻塞启动
-        let inner = Inner { snap, settings, password: None, request: None };
+        let inner = Inner { snap, settings, password: None, bad_password: false, request: None };
         Self { inner: Arc::new((Mutex::new(inner), Condvar::new())), app, dir, log_path }
     }
 
@@ -164,7 +172,11 @@ impl Monitor {
         if !old.is_empty() && old != username {
             config::delete_password(&old);
         }
-        self.lock().password = Some(password);
+        {
+            let mut g = self.lock();
+            g.password = Some(password);
+            g.bad_password = false;
+        }
         self.update_settings(|s| s.username = username)?;
         self.request(true);
         Ok(())
@@ -211,7 +223,7 @@ impl Monitor {
         }
 
         let portal = Portal::new();
-        let mut last_fp: Option<String> = None;
+        let mut last_fp: Option<Vec<String>> = None;
         let mut last_wall = SystemTime::now();
         let mut next_check = Instant::now();
         let mut failures = 0u32;
@@ -221,15 +233,17 @@ impl Monitor {
             let request = self.lock().request.take();
 
             let fp = fingerprint();
-            let changed = last_fp.as_ref().is_some_and(|old| *old != fp);
+            let diff = last_fp.as_ref().filter(|old| **old != fp).map(|old| describe_change(old, &fp));
+            let changed = diff.is_some();
             last_fp = Some(fp);
             // 睡眠期间单调时钟可能不走，用墙上时间的跳变判断是否刚唤醒
             let now = SystemTime::now();
             let resumed = now.duration_since(last_wall).is_ok_and(|d| d > TICK * 10);
             last_wall = now;
 
-            if changed {
+            if let Some(diff) = diff {
                 self.push_event("info", "网络发生变化".into());
+                self.log(&format!("  {diff}"));
             } else if resumed {
                 self.push_event("info", "系统从睡眠中唤醒".into());
             }
@@ -285,6 +299,10 @@ impl Monitor {
             self.set(Status::NoAccount, "请先填写学号和密码");
             return OFFLINE_INTERVAL;
         };
+        if self.lock().bad_password && !forced {
+            self.set(Status::Failed, BAD_PASSWORD_HINT);
+            return OFFLINE_INTERVAL;
+        }
 
         self.set(Status::LoggingIn, "");
         self.log(&format!("门户跳转地址：{}", portal_url.as_deref().unwrap_or("（无）")));
@@ -300,12 +318,29 @@ impl Monitor {
         match result {
             Ok(_) => {
                 *failures = 0;
-                self.lock().snap.logins += 1;
+                {
+                    let mut g = self.lock();
+                    g.snap.logins += 1;
+                    g.bad_password = false;
+                }
                 self.set(Status::Online, "");
                 if settings.notify {
                     self.notify("校园网已自动登录", &format!("账号 {}", settings.username));
                 }
                 ONLINE_INTERVAL
+            }
+            Err(e) if e.bad_credentials => {
+                *failures = 0;
+                self.lock().bad_password = true;
+                if let Some(html) = &e.html {
+                    let _ = fs::write(self.dir.join("last-login-response.html"), html);
+                }
+                self.log(&format!("  网关拒绝了账号密码（{}），暂停自动登录", e.message));
+                if settings.notify {
+                    self.notify("校园网密码错误", "已暂停自动登录，请在主界面更新密码");
+                }
+                self.set(Status::Failed, BAD_PASSWORD_HINT);
+                OFFLINE_INTERVAL
             }
             Err(e) => {
                 *failures += 1;
@@ -380,14 +415,31 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// 本机 IPv4 地址集合。IPv6 临时地址会周期性轮换，不纳入，避免误判网络变化。
-fn fingerprint() -> String {
+/// 本机物理网卡的 IPv4 地址集合。
+/// 不纳入 IPv6（临时地址会周期性轮换）、169.254 自分配地址（DHCP 失败时会反复出现又消失）
+/// 和虚拟网卡，避免误判网络变化。
+fn fingerprint() -> Vec<String> {
     let mut addrs: Vec<String> = if_addrs::get_if_addrs()
         .unwrap_or_default()
         .into_iter()
-        .filter(|i| !i.is_loopback() && i.ip().is_ipv4())
+        .filter(|i| match i.ip() {
+            std::net::IpAddr::V4(ip) => !ip.is_loopback() && !ip.is_link_local(),
+            std::net::IpAddr::V6(_) => false,
+        })
+        .filter(|i| {
+            let name = i.name.to_ascii_lowercase();
+            !VIRTUAL_IFACE_PREFIXES.iter().any(|p| name.starts_with(p))
+        })
         .map(|i| format!("{}={}", i.name, i.ip()))
         .collect();
     addrs.sort();
-    addrs.join(",")
+    addrs.dedup();
+    addrs
+}
+
+/// 例："+en0=10.129.1.2 -en0=10.128.3.4"
+fn describe_change(old: &[String], new: &[String]) -> String {
+    let added = new.iter().filter(|a| !old.contains(a)).map(|a| format!("+{a}"));
+    let removed = old.iter().filter(|a| !new.contains(a)).map(|a| format!("-{a}"));
+    added.chain(removed).collect::<Vec<_>>().join(" ")
 }

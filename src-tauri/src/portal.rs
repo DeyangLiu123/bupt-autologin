@@ -26,6 +26,8 @@ pub enum Probe {
 
 pub struct LoginError {
     pub message: String,
+    /// 网关明确拒绝了账号密码；此时不应自动重试，以免账号被锁
+    pub bad_credentials: bool,
     /// 网关最后返回的页面，便于排查
     pub html: Option<String>,
     pub trace: Vec<String>,
@@ -105,7 +107,7 @@ impl Portal {
             .unwrap_or_else(|| format!("{gateway}/index"));
         let base = origin(&entry).to_string();
         let fail = |message: String, html: Option<String>, trace: Vec<String>| {
-            Err(LoginError { message, html, trace })
+            Err(LoginError { bad_credentials: is_bad_credentials(&message), message, html, trace })
         };
 
         match self.agent.get(&entry).call() {
@@ -141,6 +143,10 @@ impl Portal {
             }
         }
         trace.push(format!("结果页 {} 字节", html.len()));
+        // 账号密码被拒绝时，网关把登录页连同错误框一起返回，不会进入拨号
+        if let Some(msg) = error_box(&html) {
+            return fail(msg, Some(html), trace);
+        }
 
         // 网页提交后每 2 秒查询一次 /dial，code 为 0 表示拨号完成
         let mut dial_msg = None;
@@ -186,6 +192,21 @@ fn describe(r: &ureq::Response) -> String {
         s += " (Set-Cookie)";
     }
     s
+}
+
+fn is_bad_credentials(message: &str) -> bool {
+    ["密码错误", "用户名或密码", "用户不存在", "账号不存在", "0x01000004"]
+        .iter()
+        .any(|k| message.contains(k))
+}
+
+/// 网关错误页里的 <div class="ui error message">…</div> 文本。
+fn error_box(html: &str) -> Option<String> {
+    let start = html.find("error message")?;
+    let body = &html[start..];
+    let body = &body[body.find('>')? + 1..];
+    let text = visible_text(&body[..body.find("</div>")?]);
+    (!text.is_empty()).then_some(text)
 }
 
 fn gateway_error(err: &str) -> String {
@@ -356,6 +377,19 @@ mod tests {
     }
 
     #[test]
+    fn reads_error_box() {
+        let html = r#"<form><div class="msg">
+                        <div class="ui error message">
+                            用户名或密码错误 (0x01000004)
+                        </div>
+                    </div><p>请修改后使用！</p></form>"#;
+        assert_eq!(error_box(html).as_deref(), Some("用户名或密码错误 (0x01000004)"));
+        assert!(is_bad_credentials("用户名或密码错误 (0x01000004)"));
+        assert!(!is_bad_credentials("网关拒绝访问（Access denied）"));
+        assert_eq!(error_box("<form><input name=user></form>"), None);
+    }
+
+    #[test]
     fn reads_errmsg_param() {
         let url = "http://10.3.8.216/index?errmsg=Access%20denied";
         assert_eq!(query_param(url, "errmsg").as_deref(), Some("Access denied"));
@@ -463,6 +497,24 @@ mod flow_tests {
                 "GW GET /dial cookie=true",
             ]
         );
+    }
+
+    #[test]
+    fn stops_on_wrong_password_without_dialing() {
+        let log: Log = Arc::default();
+        let gw = serve(log.clone(), "GW", |path, _, _| match path {
+            "POST /login" => (
+                "200 OK",
+                String::new(),
+                "<div class=\"ui error message\">用户名或密码错误 (0x01000004)</div>".into(),
+            ),
+            _ => ("200 OK", String::new(), "<form></form>".into()),
+        });
+
+        let err = Portal::new().login(&gw, None, "2021000000", "x").expect_err("应当失败");
+        assert_eq!(err.message, "用户名或密码错误 (0x01000004)");
+        assert!(err.bad_credentials);
+        assert_eq!(*log.lock().unwrap(), ["GW GET /index cookie=false", "GW POST /login cookie=true"]);
     }
 
     #[test]
