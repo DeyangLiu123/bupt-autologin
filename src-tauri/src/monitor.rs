@@ -5,6 +5,7 @@
 
 use crate::{
     config::{self, Settings},
+    http,
     portal::{Portal, Probe},
     tray,
 };
@@ -30,11 +31,6 @@ const MAX_BACKOFF: u64 = 600;
 const MAX_EVENTS: usize = 30;
 const MAX_LOG_BYTES: u64 = 512 * 1024;
 const BAD_PASSWORD_HINT: &str = "用户名或密码错误，已暂停自动登录，请更新密码";
-/// 虚拟网卡（VPN、虚拟机、容器、热点、AirDrop 等）的地址变化不代表换了网络
-const VIRTUAL_IFACE_PREFIXES: &[&str] = &[
-    "utun", "tun", "tap", "wg", "tailscale", "zt", "bridge", "br-", "docker", "veth", "virbr",
-    "vmnet", "vboxnet", "vethernet", "awdl", "llw", "anpi", "ap", "gif", "stf",
-];
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -286,8 +282,11 @@ impl Monitor {
             Probe::Captive(url) => url,
             Probe::Unreachable => None,
         };
-        if !portal.on_campus(&settings.gateway) {
+        if let Err(e) = portal.on_campus(&settings.gateway) {
             *failures = 0;
+            if self.lock().snap.status != Status::OffCampus {
+                self.log(&format!("无法访问认证网关：{e}"));
+            }
             self.set(Status::OffCampus, "当前网络不是北邮校园网");
             return OFFLINE_INTERVAL;
         }
@@ -417,21 +416,10 @@ fn now_secs() -> u64 {
 
 /// 本机物理网卡的 IPv4 地址集合。
 /// 不纳入 IPv6（临时地址会周期性轮换）、169.254 自分配地址（DHCP 失败时会反复出现又消失）
-/// 和虚拟网卡，避免误判网络变化。
+/// 和虚拟网卡（VPN、虚拟机等的地址变化不代表换了网络），避免误判网络变化。
 fn fingerprint() -> Vec<String> {
-    let mut addrs: Vec<String> = if_addrs::get_if_addrs()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|i| match i.ip() {
-            std::net::IpAddr::V4(ip) => !ip.is_loopback() && !ip.is_link_local(),
-            std::net::IpAddr::V6(_) => false,
-        })
-        .filter(|i| {
-            let name = i.name.to_ascii_lowercase();
-            !VIRTUAL_IFACE_PREFIXES.iter().any(|p| name.starts_with(p))
-        })
-        .map(|i| format!("{}={}", i.name, i.ip()))
-        .collect();
+    let mut addrs: Vec<String> =
+        http::physical_ipv4().into_iter().map(|i| format!("{}={}", i.name, i.ip())).collect();
     addrs.sort();
     addrs.dedup();
     addrs

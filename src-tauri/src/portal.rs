@@ -1,6 +1,7 @@
 //! 与认证网关和外网探测地址的 HTTP 交互。所有请求直连，不走系统代理。
 
-use std::time::Duration;
+use crate::http::{Client, Response};
+use std::{io, time::Duration};
 
 const APPLE_PROBE: &str = "http://captive.apple.com/hotspot-detect.html";
 const PROBE_204: &str = "http://connect.rom.miui.com/generate_204";
@@ -34,18 +35,12 @@ pub struct LoginError {
 }
 
 pub struct Portal {
-    agent: ureq::Agent,
+    http: Client,
 }
 
 impl Portal {
     pub fn new() -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(3))
-            .timeout(Duration::from_secs(6))
-            .redirects(0)
-            .user_agent(USER_AGENT)
-            .build();
-        Self { agent }
+        Self { http: Client::new(USER_AGENT, Duration::from_secs(3), Duration::from_secs(6)) }
     }
 
     /// 任一探测地址返回预期内容即视为已联网；被门户劫持时记下跳转地址。
@@ -53,24 +48,18 @@ impl Portal {
         let mut reached = false;
         let mut portal = None;
         for (url, expect_204) in [(APPLE_PROBE, false), (PROBE_204, true)] {
-            let resp = match self.agent.get(url).call() {
-                Ok(r) | Err(ureq::Error::Status(_, r)) => r,
-                Err(_) => continue,
-            };
+            let Ok(resp) = self.http.get(url) else { continue };
             reached = true;
-            let status = resp.status();
-            let location = resp.header("Location").map(str::to_string);
-            let body = resp.into_string().unwrap_or_default();
             let online = if expect_204 {
-                status == 204
+                resp.status == 204
             } else {
-                body.contains("<TITLE>Success</TITLE>")
+                resp.body.contains("<TITLE>Success</TITLE>")
             };
             if online {
                 return Probe::Online;
             }
             if portal.is_none() {
-                portal = location.or_else(|| find_url(&body));
+                portal = resp.header("Location").map(str::to_string).or_else(|| find_url(&resp.body));
             }
         }
         if reached {
@@ -85,11 +74,8 @@ impl Portal {
     }
 
     /// 能访问认证网关才说明连着校园网，否则不发登录请求。
-    pub fn on_campus(&self, gateway: &str) -> bool {
-        match self.agent.get(&format!("{gateway}/")).call() {
-            Ok(_) | Err(ureq::Error::Status(..)) => true,
-            Err(_) => false,
-        }
+    pub fn on_campus(&self, gateway: &str) -> io::Result<()> {
+        self.http.get(&format!("{gateway}/")).map(drop)
     }
 
     /// 按网页的流程登录：打开登录页拿会话 cookie → 提交表单 → 轮询 /dial 等待拨号完成。
@@ -110,36 +96,31 @@ impl Portal {
             Err(LoginError { bad_credentials: is_bad_credentials(&message), message, html, trace })
         };
 
-        match self.agent.get(&entry).call() {
-            Ok(r) | Err(ureq::Error::Status(_, r)) => {
-                trace.push(format!("GET {entry} → {}", describe(&r)));
-                let _ = r.into_string();
-            }
+        match self.http.get(&entry) {
+            Ok(r) => trace.push(format!("GET {entry} → {}", describe(&r))),
             Err(e) => return fail(format!("无法打开登录页（{e}）"), None, trace),
         }
 
-        let resp = match self
-            .agent
-            .post(&format!("{base}/login"))
-            .set("Referer", &entry)
-            .set("Origin", &base)
-            .send_form(&[("user", user), ("pass", password)])
-        {
-            Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+        let resp = match self.http.post_form(
+            &format!("{base}/login"),
+            &[("Referer", &entry), ("Origin", &base)],
+            &[("user", user), ("pass", password)],
+        ) {
+            Ok(r) => r,
             Err(e) => return fail(format!("无法连接认证网关（{e}）"), None, trace),
         };
         trace.push(format!("POST {base}/login → {}", describe(&resp)));
         let location = resp.header("Location").map(|loc| resolve(&base, loc));
-        let mut html = resp.into_string().unwrap_or_default();
+        let mut html = resp.body;
 
         // 失败时网关会跳回登录页并在 errmsg 参数里给出原因
         if let Some(next) = location {
             if let Some(err) = query_param(&next, "errmsg") {
                 return fail(gateway_error(&err), None, trace);
             }
-            if let Ok(r) | Err(ureq::Error::Status(_, r)) = self.agent.get(&next).call() {
+            if let Ok(r) = self.http.get(&next) {
                 trace.push(format!("GET {next} → {}", describe(&r)));
-                html = r.into_string().unwrap_or_default();
+                html = r.body;
             }
         }
         trace.push(format!("结果页 {} 字节", html.len()));
@@ -152,12 +133,10 @@ impl Portal {
         let mut dial_msg = None;
         for _ in 0..DIAL_TRIES {
             let reply = self
-                .agent
+                .http
                 .get(&format!("{base}/dial"))
-                .call()
                 .ok()
-                .and_then(|r| r.into_string().ok())
-                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok());
+                .and_then(|r| serde_json::from_str::<serde_json::Value>(&r.body).ok());
             let code = reply.as_ref().and_then(|v| v["code"].as_i64());
             if code == Some(0) {
                 trace.push("拨号完成".into());
@@ -183,8 +162,8 @@ impl Portal {
     }
 }
 
-fn describe(r: &ureq::Response) -> String {
-    let mut s = r.status().to_string();
+fn describe(r: &Response) -> String {
+    let mut s = r.status.to_string();
     if let Some(loc) = r.header("Location") {
         s += &format!(" Location={loc}");
     }
