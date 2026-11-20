@@ -30,7 +30,6 @@ const SETTLE_TRIES: u32 = 3;
 const MAX_BACKOFF: u64 = 600;
 const MAX_EVENTS: usize = 30;
 const MAX_LOG_BYTES: u64 = 512 * 1024;
-const BAD_PASSWORD_HINT: &str = "用户名或密码错误，已暂停自动登录，请更新密码";
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,8 +86,10 @@ struct Inner {
     snap: Snapshot,
     settings: Settings,
     password: Option<String>,
-    /// 网关明确拒绝了账号密码；在更新密码或手动检测前不再自动登录，避免账号被锁
-    bad_password: bool,
+    /// 网关连续拒绝账号密码的次数。网关偶尔会误报"用户名或密码错误"，
+    /// 所以不永久暂停，而是把重试间隔拉长到 retry_at，避免账号被锁
+    rejections: u32,
+    retry_at: chrono::DateTime<chrono::Local>,
     /// 待处理的检测请求；Some(true) 表示用户手动触发，忽略暂停和退避
     request: Option<bool>,
 }
@@ -111,7 +112,14 @@ impl Monitor {
             events: Vec::new(),
         };
         // 密码在监控线程里读取：读钥匙串可能弹出授权框，不能阻塞启动
-        let inner = Inner { snap, settings, password: None, bad_password: false, request: None };
+        let inner = Inner {
+            snap,
+            settings,
+            password: None,
+            rejections: 0,
+            retry_at: chrono::Local::now(),
+            request: None,
+        };
         Self { inner: Arc::new((Mutex::new(inner), Condvar::new())), app, dir, log_path }
     }
 
@@ -171,7 +179,7 @@ impl Monitor {
         {
             let mut g = self.lock();
             g.password = Some(password);
-            g.bad_password = false;
+            g.rejections = 0;
         }
         self.update_settings(|s| s.username = username)?;
         self.request(true);
@@ -298,8 +306,12 @@ impl Monitor {
             self.set(Status::NoAccount, "请先填写学号和密码");
             return OFFLINE_INTERVAL;
         };
-        if self.lock().bad_password && !forced {
-            self.set(Status::Failed, BAD_PASSWORD_HINT);
+        let (rejections, retry_at) = {
+            let g = self.lock();
+            (g.rejections, g.retry_at)
+        };
+        if rejections > 0 && !forced && chrono::Local::now() < retry_at {
+            self.set(Status::Failed, &rejected_hint(retry_at));
             return OFFLINE_INTERVAL;
         }
 
@@ -308,19 +320,27 @@ impl Monitor {
         let result =
             portal.login(&settings.gateway, portal_url.as_deref(), &settings.username, &password);
         let trace = match &result {
-            Ok(trace) => trace,
+            Ok(login) => &login.trace,
             Err(e) => &e.trace,
         };
         for step in trace {
             self.log(&format!("  {step}"));
         }
         match result {
+            Ok(login) if login.already => {
+                *failures = 0;
+                self.lock().rejections = 0;
+                // 先切到 Checking，日志里记为"已联网"而不是"登录成功"
+                self.set(Status::Checking, "");
+                self.set(Status::Online, "");
+                ONLINE_INTERVAL
+            }
             Ok(_) => {
                 *failures = 0;
                 {
                     let mut g = self.lock();
                     g.snap.logins += 1;
-                    g.bad_password = false;
+                    g.rejections = 0;
                 }
                 self.set(Status::Online, "");
                 if settings.notify {
@@ -330,15 +350,24 @@ impl Monitor {
             }
             Err(e) if e.bad_credentials => {
                 *failures = 0;
-                self.lock().bad_password = true;
+                let (n, retry_at) = {
+                    let mut g = self.lock();
+                    g.rejections += 1;
+                    g.retry_at = chrono::Local::now() + rejection_backoff(g.rejections);
+                    (g.rejections, g.retry_at)
+                };
                 if let Some(html) = &e.html {
                     let _ = fs::write(self.dir.join("last-login-response.html"), html);
                 }
-                self.log(&format!("  网关拒绝了账号密码（{}），暂停自动登录", e.message));
-                if settings.notify {
-                    self.notify("校园网密码错误", "已暂停自动登录，请在主界面更新密码");
+                self.log(&format!(
+                    "  网关拒绝了账号密码（{}），连续 {n} 次，{} 再试",
+                    e.message,
+                    retry_at.format("%H:%M")
+                ));
+                if n == 1 && settings.notify {
+                    self.notify("校园网提示密码错误", "稍后会自动重试；如果改过密码，请在主界面更新");
                 }
-                self.set(Status::Failed, BAD_PASSWORD_HINT);
+                self.set(Status::Failed, &rejected_hint(retry_at));
                 OFFLINE_INTERVAL
             }
             Err(e) => {
@@ -403,6 +432,19 @@ impl Monitor {
     fn notify(&self, title: &str, body: &str) {
         let _ = self.app.notification().builder().title(title).body(body).show();
     }
+}
+
+/// 网关拒绝账号密码后的重试间隔：2 分钟、10 分钟，之后每 30 分钟一次。
+fn rejection_backoff(n: u32) -> Duration {
+    Duration::from_secs(match n {
+        0 | 1 => 120,
+        2 => 600,
+        _ => 1800,
+    })
+}
+
+fn rejected_hint(retry_at: chrono::DateTime<chrono::Local>) -> String {
+    format!("网关提示用户名或密码错误，{} 自动重试；改过密码请更新", retry_at.format("%H:%M"))
 }
 
 fn push_event(g: &mut Inner, level: &'static str, text: String) {

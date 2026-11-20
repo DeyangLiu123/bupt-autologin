@@ -11,6 +11,8 @@ const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleW
 const VERIFY_TRIES: u32 = 4;
 /// 网页最多等待拨号 30 秒
 const DIAL_TRIES: u32 = 15;
+/// 拨号完成后网关可能过几十秒才放行，多等一会
+const DIALED_VERIFY_TRIES: u32 = 15;
 const VERIFY_INTERVAL: Duration = Duration::from_secs(2);
 
 const ERROR_HINTS: &[&str] = &[
@@ -23,6 +25,13 @@ pub enum Probe {
     /// 被门户拦截；附带拦截时跳转到的登录页地址（可能带有本机 IP/MAC 参数）
     Captive(Option<String>),
     Unreachable,
+}
+
+#[derive(Debug)]
+pub struct Login {
+    pub trace: Vec<String>,
+    /// 网关显示本机早已认证，没有提交账号密码
+    pub already: bool,
 }
 
 pub struct LoginError {
@@ -85,7 +94,7 @@ impl Portal {
         portal: Option<&str>,
         user: &str,
         password: &str,
-    ) -> Result<Vec<String>, LoginError> {
+    ) -> Result<Login, LoginError> {
         let mut trace = Vec::new();
         let entry = portal
             .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
@@ -96,9 +105,24 @@ impl Portal {
             Err(LoginError { bad_credentials: is_bad_credentials(&message), message, html, trace })
         };
 
-        match self.http.get(&entry) {
-            Ok(r) => trace.push(format!("GET {entry} → {}", describe(&r))),
+        let page = match self.http.get(&entry) {
+            Ok(r) => {
+                trace.push(format!("GET {entry} → {}", describe(&r)));
+                r.body
+            }
             Err(e) => return fail(format!("无法打开登录页（{e}）"), None, trace),
+        };
+        // 已认证时再提交，网关会误报"用户名或密码错误 (0x01000004)"。
+        // 常见于合盖后系统短暂唤醒、Wi-Fi 刚重连时外网探测失败
+        if already_logged_in(&page) {
+            trace.push("网关显示本机已认证，不再提交登录".into());
+            for _ in 0..DIALED_VERIFY_TRIES {
+                if self.is_online() {
+                    return Ok(Login { trace, already: true });
+                }
+                std::thread::sleep(VERIFY_INTERVAL);
+            }
+            return fail("网关显示已认证，但暂时还不能上网".into(), Some(page), trace);
         }
 
         let resp = match self.http.post_form(
@@ -131,6 +155,7 @@ impl Portal {
 
         // 网页提交后每 2 秒查询一次 /dial，code 为 0 表示拨号完成
         let mut dial_msg = None;
+        let mut dialed = false;
         for _ in 0..DIAL_TRIES {
             let reply = self
                 .http
@@ -140,7 +165,7 @@ impl Portal {
             let code = reply.as_ref().and_then(|v| v["code"].as_i64());
             if code == Some(0) {
                 trace.push("拨号完成".into());
-                dial_msg = None;
+                dialed = true;
                 break;
             }
             dial_msg = reply.and_then(|v| v["msg"].as_str().map(str::to_string));
@@ -148,15 +173,18 @@ impl Portal {
         }
 
         // 网关处理完需要一点时间放行
-        for _ in 0..VERIFY_TRIES {
+        let tries = if dialed { DIALED_VERIFY_TRIES } else { VERIFY_TRIES };
+        for _ in 0..tries {
             if self.is_online() {
-                return Ok(trace);
+                return Ok(Login { trace, already: false });
             }
             std::thread::sleep(VERIFY_INTERVAL);
         }
-        let message = match dial_msg {
-            Some(msg) => format!("拨号失败：{msg}"),
-            None => explain(&html),
+        // 拨号成功页的脚本里带有 alert('拨号失败…') 模板，此时不能从页面里找原因
+        let message = match (dialed, dial_msg) {
+            (true, _) => "拨号已完成，但暂时还不能上网".into(),
+            (false, Some(msg)) => format!("拨号失败：{msg}"),
+            (false, None) => explain(&html),
         };
         fail(message, Some(html), trace)
     }
@@ -177,6 +205,11 @@ fn is_bad_credentials(message: &str) -> bool {
     ["密码错误", "用户名或密码", "用户不存在", "账号不存在", "0x01000004"]
         .iter()
         .any(|k| message.contains(k))
+}
+
+/// 已认证时登录页换成"正在拨号 / 登录成功"页：有注销按钮，没有账号输入框。
+fn already_logged_in(html: &str) -> bool {
+    html.contains("login-success") && !html.contains("name=\"user\"")
 }
 
 /// 网关错误页里的 <div class="ui error message">…</div> 文本。
@@ -278,7 +311,8 @@ fn explain(html: &str) -> String {
     "登录后仍无法联网，网关未给出原因".into()
 }
 
-/// 取页面里的 alert('...') 文本，跳过登录页自带的表单校验提示。
+/// 取页面里的 alert('...') 文本，跳过登录页自带的表单校验提示，
+/// 以及后面还要拼接变量的提示模板（如 alert('拨号失败…' + res.msg)）。
 fn alert_message(html: &str) -> Option<String> {
     let mut rest = html;
     while let Some(pos) = rest.find("alert(") {
@@ -289,7 +323,8 @@ fn alert_message(html: &str) -> Option<String> {
         let body = &rest[1..];
         let Some(end) = body.find(quote) else { continue };
         let msg = body[..end].trim();
-        if !msg.is_empty() && !msg.starts_with("请输入") && !msg.contains("验证码") {
+        let concatenated = body[end + 1..].trim_start().starts_with('+');
+        if !msg.is_empty() && !concatenated && !msg.starts_with("请输入") && !msg.contains("验证码") {
             return Some(msg.to_string());
         }
     }
@@ -338,6 +373,12 @@ mod tests {
     }
 
     #[test]
+    fn skips_alert_templates() {
+        let html = "<script>if (time < 30) {} else { alert('拨号失败！请联系运营商。\\n错误信息:' + res.msg) }</script>";
+        assert_eq!(alert_message(html), None);
+    }
+
+    #[test]
     fn explains_text_hint() {
         let html = "<html><style>a{}</style><body><p>认证失败：账号欠费</p></body></html>";
         assert!(explain(html).contains("欠费"));
@@ -366,6 +407,18 @@ mod tests {
         assert!(is_bad_credentials("用户名或密码错误 (0x01000004)"));
         assert!(!is_bad_credentials("网关拒绝访问（Access denied）"));
         assert_eq!(error_box("<form><input name=user></form>"), None);
+    }
+
+    #[test]
+    fn detects_logged_in_page() {
+        let online = r#"<div class="login-success" style="display: none;"><h3 class="center title">登录成功</h3>
+            <button onclick="logout()">注销</button></div>
+            <div class="login-process"><h3 class="center title">正在拨号，请等待...</h3></div>"#;
+        let form = r#"<form id="form" method="POST" action="login">
+            <input placeholder="输入账号" type="text" class="el-input__inner" name="user"></form>"#;
+        assert!(already_logged_in(online));
+        assert!(!already_logged_in(form));
+        assert!(!already_logged_in("<form></form>"));
     }
 
     #[test]
