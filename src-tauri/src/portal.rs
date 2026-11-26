@@ -14,6 +14,8 @@ const DIAL_TRIES: u32 = 15;
 /// 拨号完成后网关可能过几十秒才放行，多等一会
 const DIALED_VERIFY_TRIES: u32 = 15;
 const VERIFY_INTERVAL: Duration = Duration::from_secs(2);
+/// 网关处理登录有时要十几秒才回复，普通请求的 6 秒不够
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 const ERROR_HINTS: &[&str] = &[
     "密码错误", "密码不正确", "用户不存在", "账号不存在", "欠费", "余额不足",
@@ -45,11 +47,15 @@ pub struct LoginError {
 
 pub struct Portal {
     http: Client,
+    login_timeout: Duration,
 }
 
 impl Portal {
     pub fn new() -> Self {
-        Self { http: Client::new(USER_AGENT, Duration::from_secs(3), Duration::from_secs(6)) }
+        Self {
+            http: Client::new(USER_AGENT, Duration::from_secs(3), Duration::from_secs(6)),
+            login_timeout: LOGIN_TIMEOUT,
+        }
     }
 
     /// 任一探测地址返回预期内容即视为已联网；被门户劫持时记下跳转地址。
@@ -125,32 +131,39 @@ impl Portal {
             return fail("网关显示已认证，但暂时还不能上网".into(), Some(page), trace);
         }
 
-        let resp = match self.http.post_form(
+        let mut html = String::new();
+        match self.http.post_form(
             &format!("{base}/login"),
             &[("Referer", &entry), ("Origin", &base)],
             &[("user", user), ("pass", password)],
+            self.login_timeout,
         ) {
-            Ok(r) => r,
-            Err(e) => return fail(format!("无法连接认证网关（{e}）"), None, trace),
-        };
-        trace.push(format!("POST {base}/login → {}", describe(&resp)));
-        let location = resp.header("Location").map(|loc| resolve(&base, loc));
-        let mut html = resp.body;
+            Ok(resp) => {
+                trace.push(format!("POST {base}/login → {}", describe(&resp)));
+                let location = resp.header("Location").map(|loc| resolve(&base, loc));
+                html = resp.body;
 
-        // 失败时网关会跳回登录页并在 errmsg 参数里给出原因
-        if let Some(next) = location {
-            if let Some(err) = query_param(&next, "errmsg") {
-                return fail(gateway_error(&err), None, trace);
+                // 失败时网关会跳回登录页并在 errmsg 参数里给出原因
+                if let Some(next) = location {
+                    if let Some(err) = query_param(&next, "errmsg") {
+                        return fail(gateway_error(&err), None, trace);
+                    }
+                    if let Ok(r) = self.http.get(&next) {
+                        trace.push(format!("GET {next} → {}", describe(&r)));
+                        html = r.body;
+                    }
+                }
+                trace.push(format!("结果页 {} 字节", html.len()));
+                // 账号密码被拒绝时，网关把登录页连同错误框一起返回，不会进入拨号
+                if let Some(msg) = error_box(&html) {
+                    return fail(msg, Some(html), trace);
+                }
             }
-            if let Ok(r) = self.http.get(&next) {
-                trace.push(format!("GET {next} → {}", describe(&r)));
-                html = r.body;
+            // 网关迟迟不回复时往往已经收下了登录请求，接着查拨号结果，不重新提交
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                trace.push(format!("POST {base}/login 等待响应超时，继续查询拨号结果"));
             }
-        }
-        trace.push(format!("结果页 {} 字节", html.len()));
-        // 账号密码被拒绝时，网关把登录页连同错误框一起返回，不会进入拨号
-        if let Some(msg) = error_box(&html) {
-            return fail(msg, Some(html), trace);
+            Err(e) => return fail(format!("无法连接认证网关（{e}）"), None, trace),
         }
 
         // 网页提交后每 2 秒查询一次 /dial，code 为 0 表示拨号完成
@@ -184,9 +197,10 @@ impl Portal {
         let message = match (dialed, dial_msg) {
             (true, _) => "拨号已完成，但暂时还不能上网".into(),
             (false, Some(msg)) => format!("拨号失败：{msg}"),
+            (false, None) if html.is_empty() => "网关没有回复登录请求".into(),
             (false, None) => explain(&html),
         };
-        fail(message, Some(html), trace)
+        fail(message, (!html.is_empty()).then_some(html), trace)
     }
 }
 
@@ -528,6 +542,33 @@ mod flow_tests {
                 "GW GET /dial cookie=true",
                 "GW GET /dial cookie=true",
             ]
+        );
+    }
+
+    /// 网关收下登录请求却迟迟不回复时，不重新提交，接着查拨号结果。需要联网：cargo test -- --ignored
+    #[test]
+    #[ignore]
+    fn keeps_polling_dial_when_login_reply_is_slow() {
+        let log: Log = Arc::default();
+        let gw = serve(log.clone(), "GW", |path, _, _| match path {
+            "POST /login" => {
+                std::thread::sleep(Duration::from_millis(800));
+                ("200 OK", String::new(), "<h3>正在拨号，请等待...</h3>".into())
+            }
+            "GET /dial" => ("200 OK", String::new(), "{\"code\": 0}".into()),
+            _ => ("200 OK", String::new(), "<form></form>".into()),
+        });
+
+        let mut portal = Portal::new();
+        portal.login_timeout = Duration::from_millis(200);
+        let login = match portal.login(&gw, None, "2021000000", "x") {
+            Ok(login) => login,
+            Err(e) => panic!("登录失败：{}；trace={:?}", e.message, e.trace),
+        };
+        assert!(login.trace.iter().any(|t| t.contains("等待响应超时")));
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["GW GET /index cookie=false", "GW POST /login cookie=true", "GW GET /dial cookie=true"]
         );
     }
 

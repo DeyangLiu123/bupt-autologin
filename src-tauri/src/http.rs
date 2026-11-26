@@ -62,17 +62,19 @@ impl Client {
     }
 
     pub fn get(&self, url: &str) -> io::Result<Response> {
-        self.send("GET", url, &[], None)
+        self.send("GET", url, &[], None, self.timeout)
     }
 
+    /// 提交表单；timeout 是等待响应的时间，网关处理登录可能比普通请求慢。
     pub fn post_form(
         &self,
         url: &str,
         headers: &[(&str, &str)],
         form: &[(&str, &str)],
+        timeout: Duration,
     ) -> io::Result<Response> {
         let body = form.iter().map(|(k, v)| format!("{}={}", encode(k), encode(v)));
-        self.send("POST", url, headers, Some(body.collect::<Vec<_>>().join("&")))
+        self.send("POST", url, headers, Some(body.collect::<Vec<_>>().join("&")), timeout)
     }
 
     fn send(
@@ -81,6 +83,7 @@ impl Client {
         url: &str,
         headers: &[(&str, &str)],
         body: Option<String>,
+        timeout: Duration,
     ) -> io::Result<Response> {
         let (host, path) = split_url(url)?;
         let mut req = format!(
@@ -104,8 +107,9 @@ impl Client {
         req += body.as_deref().unwrap_or("");
 
         let mut stream = self.connect(host)?;
-        stream.write_all(req.as_bytes())?;
-        let resp = read_response(&mut stream)?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.write_all(req.as_bytes()).map_err(timed_out)?;
+        let resp = read_response(&mut stream).map_err(timed_out)?;
         self.store_cookies(host, &resp);
         Ok(resp)
     }
@@ -136,7 +140,6 @@ impl Client {
         #[cfg(not(target_os = "macos"))]
         let _ = iface;
         socket.connect_timeout(&SockAddr::from(addr), self.connect_timeout)?;
-        socket.set_read_timeout(Some(self.timeout))?;
         socket.set_write_timeout(Some(self.timeout))?;
         Ok(socket.into())
     }
@@ -196,6 +199,16 @@ fn encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// macOS 上读写超时报的是 EAGAIN（"Resource temporarily unavailable (os error 35)"），统一成超时。
+fn timed_out(e: io::Error) -> io::Error {
+    match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => {
+            io::Error::new(io::ErrorKind::TimedOut, "等待响应超时")
+        }
+        _ => e,
+    }
 }
 
 fn invalid(msg: &str) -> io::Error {
@@ -304,6 +317,22 @@ mod tests {
         assert!(parse(raw, false).unwrap().is_none());
         assert_eq!(parse(raw, true).unwrap().unwrap().body, "hello");
         assert_eq!(parse(b"HTTP/1.1 204 No Content\r\n\r\n", false).unwrap().unwrap().status, 204);
+    }
+
+    #[test]
+    fn reports_timeout_when_server_is_silent() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/login", listener.local_addr().unwrap());
+        // 收下连接但不回复
+        std::thread::spawn(move || {
+            let _conns: Vec<_> = listener.incoming().collect();
+        });
+        let client = Client::new("test", Duration::from_secs(1), Duration::from_secs(5));
+        let Err(err) = client.post_form(&url, &[], &[("a", "b")], Duration::from_millis(200)) else {
+            panic!("应当超时");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(err.to_string(), "等待响应超时");
     }
 
     #[test]
