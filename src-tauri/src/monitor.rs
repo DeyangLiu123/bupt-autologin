@@ -90,6 +90,9 @@ struct Inner {
     /// 所以不永久暂停，而是把重试间隔拉长到 retry_at，避免账号被锁
     rejections: u32,
     retry_at: chrono::DateTime<chrono::Local>,
+    /// 本轮掉线已经弹过"自动登录失败"通知；恢复联网前不再重复弹。
+    /// 合盖时系统每隔几分钟短暂唤醒一次，每次都可能失败，不能每次都通知
+    fail_notified: bool,
     /// 待处理的检测请求；Some(true) 表示用户手动触发，忽略暂停和退避
     request: Option<bool>,
 }
@@ -118,6 +121,7 @@ impl Monitor {
             password: None,
             rejections: 0,
             retry_at: chrono::Local::now(),
+            fail_notified: false,
             request: None,
         };
         Self { inner: Arc::new((Mutex::new(inner), Condvar::new())), app, dir, log_path }
@@ -281,14 +285,20 @@ impl Monitor {
             (g.settings.clone(), g.password.clone())
         };
 
-        let portal_url = match portal.probe() {
+        let (portal_url, probe_note) = match portal.probe() {
             Probe::Online => {
                 *failures = 0;
                 self.set(Status::Online, "");
                 return ONLINE_INTERVAL;
             }
-            Probe::Captive(url) => url,
-            Probe::Unreachable => None,
+            Probe::Captive(url) => {
+                let note = match &url {
+                    Some(u) => format!("外网探测被门户拦截，跳转地址：{u}"),
+                    None => "外网探测被门户拦截".into(),
+                };
+                (url, note)
+            }
+            Probe::Unreachable(e) => (None, format!("外网探测失败（{e}）")),
         };
         if let Err(e) = portal.on_campus(&settings.gateway) {
             *failures = 0;
@@ -316,9 +326,11 @@ impl Monitor {
         }
 
         self.set(Status::LoggingIn, "");
-        self.log(&format!("门户跳转地址：{}", portal_url.as_deref().unwrap_or("（无）")));
+        self.log(&probe_note);
+        let started = (Instant::now(), SystemTime::now());
         let result =
             portal.login(&settings.gateway, portal_url.as_deref(), &settings.username, &password);
+        let slept = slept_since(started);
         let trace = match &result {
             Ok(login) => &login.trace,
             Err(e) => &e.trace,
@@ -370,12 +382,19 @@ impl Monitor {
                 self.set(Status::Failed, &rejected_hint(retry_at));
                 OFFLINE_INTERVAL
             }
+            // 合盖时系统只短暂唤醒十来秒，登录做到一半又睡了，请求超时不代表网关有问题
+            Err(e) if slept => {
+                self.log(&format!("  登录途中系统进入睡眠（{}），稍后重新检测", e.message));
+                self.set(Status::Checking, "");
+                SETTLE_INTERVAL
+            }
             Err(e) => {
                 *failures += 1;
                 if let Some(html) = &e.html {
                     let _ = fs::write(self.dir.join("last-login-response.html"), html);
                 }
-                if *failures == 1 && settings.notify {
+                let notified = std::mem::replace(&mut self.lock().fail_notified, true);
+                if !notified && settings.notify {
                     self.notify("校园网自动登录失败", &e.message);
                 }
                 self.set(Status::Failed, &e.message);
@@ -393,6 +412,9 @@ impl Monitor {
             let mut g = self.lock();
             let prev = g.snap.status;
             let changed = prev != status;
+            if status == Status::Online {
+                g.fail_notified = false;
+            }
             if changed && status != Status::Checking {
                 let (level, text) = match status {
                     Status::Online if prev == Status::LoggingIn => ("ok", "登录成功".into()),
@@ -441,6 +463,12 @@ fn rejection_backoff(n: u32) -> Duration {
         2 => 600,
         _ => 1800,
     })
+}
+
+/// 期间系统是否睡眠过：睡眠时单调时钟不走，墙上时间照走。
+fn slept_since((mono, wall): (Instant, SystemTime)) -> bool {
+    let wall = SystemTime::now().duration_since(wall).unwrap_or_default();
+    wall > mono.elapsed() + Duration::from_secs(10)
 }
 
 fn rejected_hint(retry_at: chrono::DateTime<chrono::Local>) -> String {

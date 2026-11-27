@@ -26,13 +26,14 @@ pub enum Probe {
     Online,
     /// 被门户拦截；附带拦截时跳转到的登录页地址（可能带有本机 IP/MAC 参数）
     Captive(Option<String>),
-    Unreachable,
+    /// 探测地址都连不上；附带最后一个错误
+    Unreachable(String),
 }
 
 #[derive(Debug)]
 pub struct Login {
     pub trace: Vec<String>,
-    /// 网关显示本机早已认证，没有提交账号密码
+    /// 本机早已认证（网关页面显示已登录，或外网其实已可访问），不算一次新的登录
     pub already: bool,
 }
 
@@ -48,6 +49,8 @@ pub struct LoginError {
 pub struct Portal {
     http: Client,
     login_timeout: Duration,
+    /// (地址, 是否期望 204)；测试时换成本地地址
+    probes: Vec<(String, bool)>,
 }
 
 impl Portal {
@@ -55,6 +58,7 @@ impl Portal {
         Self {
             http: Client::new(USER_AGENT, Duration::from_secs(3), Duration::from_secs(6)),
             login_timeout: LOGIN_TIMEOUT,
+            probes: vec![(APPLE_PROBE.into(), false), (PROBE_204.into(), true)],
         }
     }
 
@@ -62,10 +66,17 @@ impl Portal {
     pub fn probe(&self) -> Probe {
         let mut reached = false;
         let mut portal = None;
-        for (url, expect_204) in [(APPLE_PROBE, false), (PROBE_204, true)] {
-            let Ok(resp) = self.http.get(url) else { continue };
+        let mut error = String::new();
+        for (url, expect_204) in &self.probes {
+            let resp = match self.http.get(url) {
+                Ok(r) => r,
+                Err(e) => {
+                    error = format!("{}：{e}", host_of(url));
+                    continue;
+                }
+            };
             reached = true;
-            let online = if expect_204 {
+            let online = if *expect_204 {
                 resp.status == 204
             } else {
                 resp.body.contains("<TITLE>Success</TITLE>")
@@ -80,7 +91,7 @@ impl Portal {
         if reached {
             Probe::Captive(portal)
         } else {
-            Probe::Unreachable
+            Probe::Unreachable(error)
         }
     }
 
@@ -130,6 +141,12 @@ impl Portal {
             }
             return fail("网关显示已认证，但暂时还不能上网".into(), Some(page), trace);
         }
+        // 合盖后系统短暂唤醒、Wi-Fi 刚重连时，第一次外网探测常常失败，网关登录页也照样显示表单，
+        // 其实本机仍已认证；这时提交会得到"认证失败 (0x01000001)"。提交前再确认一次
+        if self.is_online() {
+            trace.push("外网已可访问，不再提交登录".into());
+            return Ok(Login { trace, already: true });
+        }
 
         let mut html = String::new();
         match self.http.post_form(
@@ -154,8 +171,13 @@ impl Portal {
                     }
                 }
                 trace.push(format!("结果页 {} 字节", html.len()));
-                // 账号密码被拒绝时，网关把登录页连同错误框一起返回，不会进入拨号
+                // 账号密码被拒绝时，网关把登录页连同错误框一起返回，不会进入拨号。
+                // 已认证时重复提交也会得到错误框，能上网就不算失败
                 if let Some(msg) = error_box(&html) {
+                    if self.is_online() {
+                        trace.push(format!("网关回复“{msg}”，但外网已可访问"));
+                        return Ok(Login { trace, already: true });
+                    }
                     return fail(msg, Some(html), trace);
                 }
             }
@@ -266,6 +288,12 @@ fn query_param(url: &str, key: &str) -> Option<String> {
         i += 1;
     }
     Some(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// "http://host:port/path" → "host:port"
+fn host_of(url: &str) -> &str {
+    let o = origin(url);
+    o.find("://").map_or(o, |i| &o[i + 3..])
 }
 
 /// "http://host:port/path" → "http://host:port"
@@ -459,7 +487,10 @@ mod flow_tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    };
 
     type Log = Arc<Mutex<Vec<String>>>;
 
@@ -508,13 +539,29 @@ mod flow_tests {
         addr
     }
 
-    /// 最后一步要确认外网连通，需要联网，所以默认不跑：cargo test -- --ignored
+    /// 模拟外网探测地址：online 为 true 时返回 Success，否则返回门户拦截页。
+    fn probe_server(online: Arc<AtomicBool>) -> String {
+        serve(Log::default(), "PROBE", move |_, _, _| {
+            let body = if online.load(Ordering::SeqCst) {
+                "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"
+            } else {
+                "<html>portal</html>"
+            };
+            ("200 OK", String::new(), body.into())
+        })
+    }
+
+    fn portal(online: &Arc<AtomicBool>) -> Portal {
+        let probe = probe_server(online.clone());
+        Portal { probes: vec![(format!("{probe}/hotspot-detect.html"), false)], ..Portal::new() }
+    }
+
     #[test]
-    #[ignore]
     fn logs_in_and_waits_for_dial() {
         let log: Log = Arc::default();
+        let online = Arc::new(AtomicBool::new(false));
         let dial_calls = Arc::new(Mutex::new(0));
-        let dials = dial_calls.clone();
+        let (dials, up) = (dial_calls.clone(), online.clone());
         let gw = serve(log.clone(), "GW", move |path, _, body| match path {
             "POST /login" => {
                 assert_eq!(body, "user=2021000000&pass=p%40ss");
@@ -524,15 +571,17 @@ mod flow_tests {
                 let mut n = dials.lock().unwrap();
                 *n += 1;
                 let code = if *n < 3 { 1 } else { 0 };
+                up.store(code == 0, Ordering::SeqCst);
                 ("200 OK", String::new(), format!("{{\"code\": {code}, \"msg\": \"dialing\"}}"))
             }
             _ => ("200 OK", String::new(), "<form></form>".into()),
         });
 
-        let result = Portal::new().login(&gw, None, "2021000000", "p@ss");
-        if let Err(e) = &result {
-            panic!("登录失败：{}；trace={:?}", e.message, e.trace);
-        }
+        let login = match portal(&online).login(&gw, None, "2021000000", "p@ss") {
+            Ok(login) => login,
+            Err(e) => panic!("登录失败：{}；trace={:?}", e.message, e.trace),
+        };
+        assert!(!login.already);
         assert_eq!(
             *log.lock().unwrap(),
             [
@@ -545,21 +594,25 @@ mod flow_tests {
         );
     }
 
-    /// 网关收下登录请求却迟迟不回复时，不重新提交，接着查拨号结果。需要联网：cargo test -- --ignored
+    /// 网关收下登录请求却迟迟不回复时，不重新提交，接着查拨号结果。
     #[test]
-    #[ignore]
     fn keeps_polling_dial_when_login_reply_is_slow() {
         let log: Log = Arc::default();
-        let gw = serve(log.clone(), "GW", |path, _, _| match path {
+        let online = Arc::new(AtomicBool::new(false));
+        let up = online.clone();
+        let gw = serve(log.clone(), "GW", move |path, _, _| match path {
             "POST /login" => {
                 std::thread::sleep(Duration::from_millis(800));
                 ("200 OK", String::new(), "<h3>正在拨号，请等待...</h3>".into())
             }
-            "GET /dial" => ("200 OK", String::new(), "{\"code\": 0}".into()),
+            "GET /dial" => {
+                up.store(true, Ordering::SeqCst);
+                ("200 OK", String::new(), "{\"code\": 0}".into())
+            }
             _ => ("200 OK", String::new(), "<form></form>".into()),
         });
 
-        let mut portal = Portal::new();
+        let mut portal = portal(&online);
         portal.login_timeout = Duration::from_millis(200);
         let login = match portal.login(&gw, None, "2021000000", "x") {
             Ok(login) => login,
@@ -572,9 +625,52 @@ mod flow_tests {
         );
     }
 
+    /// Wi-Fi 刚重连时第一次探测失败、登录页仍显示表单，但其实已认证：不提交账号密码。
+    #[test]
+    fn skips_submit_when_already_online() {
+        let log: Log = Arc::default();
+        let online = Arc::new(AtomicBool::new(true));
+        let gw = serve(log.clone(), "GW", |path, _, _| match path {
+            "POST /login" => panic!("已认证时不应提交登录"),
+            _ => ("200 OK", String::new(), "<form><input name=\"user\"></form>".into()),
+        });
+
+        let login = portal(&online).login(&gw, None, "2021000000", "x").ok().expect("应当视为已认证");
+        assert!(login.already);
+        assert_eq!(*log.lock().unwrap(), ["GW GET /index cookie=false"]);
+    }
+
+    /// 已认证时提交会得到"认证失败 (0x01000001)"错误框；外网能访问就不算失败。
+    #[test]
+    fn error_box_while_online_is_not_failure() {
+        let log: Log = Arc::default();
+        let online = Arc::new(AtomicBool::new(false));
+        let up = online.clone();
+        let gw = serve(log.clone(), "GW", move |path, _, _| match path {
+            "POST /login" => {
+                up.store(true, Ordering::SeqCst);
+                (
+                    "200 OK",
+                    String::new(),
+                    "<div class=\"ui error message\">认证失败 (0x01000001)</div>".into(),
+                )
+            }
+            _ => ("200 OK", String::new(), "<form></form>".into()),
+        });
+
+        let login = match portal(&online).login(&gw, None, "2021000000", "x") {
+            Ok(login) => login,
+            Err(e) => panic!("不应失败：{}；trace={:?}", e.message, e.trace),
+        };
+        assert!(login.already);
+        assert!(login.trace.iter().any(|t| t.contains("0x01000001") && t.contains("外网已可访问")));
+        assert_eq!(*log.lock().unwrap(), ["GW GET /index cookie=false", "GW POST /login cookie=true"]);
+    }
+
     #[test]
     fn stops_on_wrong_password_without_dialing() {
         let log: Log = Arc::default();
+        let online = Arc::new(AtomicBool::new(false));
         let gw = serve(log.clone(), "GW", |path, _, _| match path {
             "POST /login" => (
                 "200 OK",
@@ -584,7 +680,7 @@ mod flow_tests {
             _ => ("200 OK", String::new(), "<form></form>".into()),
         });
 
-        let err = Portal::new().login(&gw, None, "2021000000", "x").expect_err("应当失败");
+        let err = portal(&online).login(&gw, None, "2021000000", "x").expect_err("应当失败");
         assert_eq!(err.message, "用户名或密码错误 (0x01000004)");
         assert!(err.bad_credentials);
         assert_eq!(*log.lock().unwrap(), ["GW GET /index cookie=false", "GW POST /login cookie=true"]);
@@ -593,6 +689,7 @@ mod flow_tests {
     #[test]
     fn reports_errmsg_without_dialing() {
         let log: Log = Arc::default();
+        let online = Arc::new(AtomicBool::new(false));
         let gw = serve(log.clone(), "GW", |path, _, _| match path {
             "POST /login" => (
                 "302 Found",
@@ -602,8 +699,19 @@ mod flow_tests {
             _ => ("200 OK", String::new(), "<form></form>".into()),
         });
 
-        let err = Portal::new().login(&gw, None, "2021000000", "x").expect_err("应当失败");
+        let err = portal(&online).login(&gw, None, "2021000000", "x").expect_err("应当失败");
         assert_eq!(err.message, "网关拒绝访问（Access denied）");
         assert_eq!(*log.lock().unwrap(), ["GW GET /index cookie=false", "GW POST /login cookie=true"]);
+    }
+
+    #[test]
+    fn probe_reports_unreachable_reason() {
+        // 先占一个端口再关掉，保证连不上
+        let addr = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let portal = Portal { probes: vec![(format!("http://{addr}/"), true)], ..Portal::new() };
+        match portal.probe() {
+            Probe::Unreachable(e) => assert!(e.starts_with(&format!("{addr}：")), "{e}"),
+            _ => panic!("应当无法访问"),
+        }
     }
 }

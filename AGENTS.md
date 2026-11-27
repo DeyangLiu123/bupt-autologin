@@ -8,8 +8,7 @@
 npm install
 npm run dev                                         # 开发运行
 npm run build                                       # 构建当前平台安装包
-cd src-tauri && cargo test                          # 单元测试（含用本地端口模拟网关的流程测试）
-cd src-tauri && cargo test -- --ignored             # 需要联网的测试（会访问外网探测地址）
+cd src-tauri && cargo test                          # 单元测试（含用本地端口模拟网关和外网探测地址的流程测试）
 cd src-tauri && cargo clippy --all-targets          # 提交前保持无警告
 ```
 
@@ -31,14 +30,14 @@ cd src-tauri && cargo clippy --all-targets          # 提交前保持无警告
 - **不要换回 ureq/reqwest 等 HTTP 库。** macOS 检测到 Wi-Fi 需要网页认证时，会把该网卡的路由优先级设为 Never（系统日志里是 `SetInterfaceRank(en0) = Never`），直到用户在系统认证弹窗里登录。这期间没有默认路由，只有绑定网卡（`IP_BOUND_IF`）的连接能到达网关。现成的库不能指定网卡，所以 `http.rs` 用 socket2 自己发请求。
 - **所有请求直连、不走代理**，绑定物理网卡也让 Tailscale 等 VPN 不影响检测。物理网卡的判定在 `http::physical_ipv4()`，`monitor.rs` 的网络变化指纹也用它。
 - **省电省流量是硬要求**：平时每 3 秒只读本机网卡地址（无网络请求）；只有地址变化、睡眠唤醒、手动触发或到期（在线 60 秒 / 离线 30 秒）才发探测。不要加高频轮询。
-- **避免账号被锁**：网关回复密码错误时不立即重试，按 `rejection_backoff` 拉长间隔；更新密码或登录成功后重新计数。合盖短暂唤醒时本机常常其实仍已认证，此时提交登录也会得到"用户名或密码错误 (0x01000004)"，所以登录前先看 `/index` 是否已是认证成功页。
+- **避免账号被锁**：网关回复密码错误时不立即重试，按 `rejection_backoff` 拉长间隔；更新密码或登录成功后重新计数。合盖时系统每隔一两分钟 DarkWake 十来秒，Wi-Fi 重连后第一次外网探测常常失败，但本机其实仍已认证，此时提交登录会得到"用户名或密码错误 (0x01000004)"或"认证失败 (0x01000001)"。所以提交前先看 `/index` 是否已是认证成功页、再探测一次外网；提交后收到错误框也先确认外网，能上网就不算失败。登录途中系统睡着导致的超时不计失败；"自动登录失败"通知在恢复联网前只弹一次。
 - **密码只存系统凭据库**（keyring），不写文件、不写日志。日志里只能出现学号。
 - 网关的错误原因在 `<div class="ui error message">` 或跳转地址的 `errmsg` 参数里；页面脚本里的 `alert(...)` 多是模板，不能当成失败原因。
 
 ## 约定
 
 - 代码注释、UI 文案、日志、提交信息都用中文，风格简洁，与现有代码一致。
-- 改动网关交互时，在 `portal.rs` 的 `flow_tests` 里用本地模拟网关补测试。
+- 改动网关交互时，在 `portal.rs` 的 `flow_tests` 里用本地模拟网关补测试；外网探测也用 `probe_server` 模拟，测试不访问外网。
 - 版本号要同时改三处：`package.json`、`src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`（再跑一次 cargo 更新 `Cargo.lock`）。`package-lock.json` 里的版本一直没跟着改，不用动。
 - 提交信息格式：首行一句话概括，空行后用 `- ` 列出要点，最后一条写"版本 x.y.z"。
 

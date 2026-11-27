@@ -1,6 +1,6 @@
 [package]
 name = "bupt-autologin"
-version = "0.1.6"
+version = "0.1.7"
 description = "北邮校园网掉线自动认证"
 license = "MIT"
 edition = "2021"
